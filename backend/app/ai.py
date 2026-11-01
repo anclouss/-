@@ -74,15 +74,125 @@ def transcribe(
     return words
 
 
+def _exception_chain(exc: BaseException) -> list[BaseException]:
+    """Follow native, HTTP and thread-pool wrappers without printing their text."""
+    pending, result, seen = [exc], [], set()
+    while pending and len(result) < 64:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        result.append(current)
+        for nested in (current.__cause__, current.__context__):
+            if isinstance(nested, BaseException):
+                pending.append(nested)
+        # snapshot downloads may aggregate concurrent failures on Python 3.11+.
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+    return result
+
+
+def local_transcription_error(exc: BaseException, phase: str, model_name: str = "small") -> AIError:
+    """Explain local STT failures using fixed messages, never provider error text.
+
+    Third-party errors can contain credentials and signed download URLs. Inspect
+    them only to classify a failure; the public message contains a stable code,
+    phase and safe exception class, not str(exc), request headers or paths.
+    Hugging Face may use httpx, httpx2 or Xet, so inspect the whole cause chain
+    instead of depending on one HTTP client's inheritance hierarchy.
+    """
+    chain = _exception_chain(exc)
+    names = {type(error).__name__ for error in chain}
+    modules = {type(error).__module__ for error in chain}
+    errno_values = {getattr(error, "errno", None) for error in chain}
+    winerrors = {getattr(error, "winerror", None) for error in chain}
+    messages = []
+    for error in chain:
+        try:
+            messages.append(str(error).lower())
+        except Exception:
+            pass
+    text = "\n".join(messages)
+    statuses = set()
+    for error in chain:
+        response = getattr(error, "response", None)
+        status = getattr(response, "status_code", None)
+        if isinstance(status, int):
+            statuses.add(status)
+    # Native Xet errors may retain only a status description, not a Response.
+    for match in re.finditer(r"(?:http[^\n]{0,16}status|status(?: code)?|http)[^\n]{0,32}?\b(401|403|404|429|50[0-9])\b", text):
+        statuses.add(int(match[1]))
+
+    phases = {"import": ("загрузка библиотек", "IMPORT"),
+              "load": ("загрузка модели", "LOAD"),
+              "inference": ("распознавание аудио", "INFERENCE")}
+    phase_label, phase_code = phases.get(phase, ("распознавание", "ERROR"))
+    known_models = {"tiny", "base", "small", "medium", "large-v3", "turbo"}
+    model_label = f" «{model_name}»" if model_name in known_models else ""
+
+    def failure(category: str, explanation: str) -> AIError:
+        return AIError(f"Whisper{model_label}: {phase_label}. [STT_{phase_code}_{category}] {explanation}")
+
+    missing = {getattr(error, "name", None) for error in chain if isinstance(error, ModuleNotFoundError)}
+    if "faster_whisper" in missing:
+        return failure("PACKAGE", "Не установлен faster-whisper. Повторите установку backend/requirements.txt в окружении приложения.")
+    packages = sorted(missing & {"ctranslate2", "onnxruntime", "numpy", "av", "tokenizers"})
+    if packages:
+        return failure("DEPENDENCY", f"Не установлена зависимость {packages[0]}. Повторите установку backend/requirements.txt в окружении приложения.")
+    if 28 in errno_values or 112 in winerrors:
+        return failure("DISK", "Недостаточно свободного места для модели или временных файлов. Освободите место на диске с каталогом data и повторите.")
+    if errno_values & {1, 13} or 5 in winerrors:
+        return failure("PERMISSION", "Нет доступа к каталогу модели. Перенесите приложение в обычную доступную для записи папку и проверьте права/блокировку антивирусом.")
+    if 206 in winerrors or 36 in errno_values:
+        return failure("PATH", "Путь к файлам модели слишком длинный. Распакуйте проект в короткий путь, например C:\\ClipForge, и повторите.")
+    if any(isinstance(error, MemoryError) for error in chain) or 12 in errno_values or winerrors & {8, 14, 1455} or any(marker in text for marker in ("out of memory", "bad_alloc", "failed to allocate", "cannot allocate memory", "allocation failed")):
+        return failure("MEMORY", "Не удалось выделить память для модели. Закройте тяжёлые приложения и явно выберите base или small вместо large-v3/medium; затем повторите обработку.")
+    if statuses & {401, 403}:
+        return failure("ACCESS", "Сервис загрузки модели отклонил запрос (HTTP 401/403). Проверьте доступ к Hugging Face и его хранилищу, прокси и правильность времени Windows. Не отключайте проверку TLS.")
+    if 429 in statuses:
+        return failure("RATE_LIMIT", "Сервис загрузки модели ограничил запросы (HTTP 429). Подождите и повторите загрузку.")
+    if 404 in statuses:
+        return failure("MODEL_NOT_FOUND", "Файлы модели не найдены на сервере (HTTP 404). Проверьте выбранную модель и доступ к Hugging Face.")
+    if any(status >= 500 for status in statuses):
+        return failure("SERVICE", "Сервис хранения модели временно недоступен (HTTP 5xx). Повторите обработку позже.")
+    if any(marker in text for marker in ("certificate verify failed", "certificate_verify_failed", "sslcertverificationerror", "self signed certificate", "unable to get local issuer", "unknownissuer", "unknown issuer", "invalid peer certificate")) or "SSLCertVerificationError" in names:
+        return failure("TLS", "Не удалось проверить сертификат сервера модели. Проверьте время Windows и доверенный сертификат рабочего прокси. Не отключайте проверку TLS.")
+    if "int8" in text and "comput" in text and any(marker in text for marker in ("not support", "unsupported", "does not support")):
+        return failure("COMPUTE_INT8", "Этот процессор или backend не поддерживает выбранный int8-режим. Задайте WHISPER_DEVICE=cpu и WHISPER_COMPUTE_TYPE=float32 в .env, затем перезапустите приложение. Потребление памяти может увеличиться.")
+    if any(marker in text for marker in ("cuda", "cudnn", "cublas", "float16 compute", "requested float16", "unsupported compute type")):
+        return failure("COMPUTE", "Не удалось использовать выбранный режим вычислений. Для обычного компьютера задайте WHISPER_DEVICE=cpu и WHISPER_COMPUTE_TYPE=int8 в .env, затем перезапустите приложение.")
+    if winerrors & {126, 127, 193, 1114} or any(marker in text for marker in ("dll load failed", "specified module could not be found", "cannot load library", "vcruntime", "msvcp140")):
+        return failure("NATIVE", "Не загружается нативная библиотека Whisper/VAD. На Windows установите Microsoft Visual C++ Redistributable 2015–2022 x64 с сайта Microsoft; используйте 64-битный Python 3.12 и перезапустите приложение.")
+    if any(marker in text for marker in ("illegal instruction", "unsupported instruction", "cpu does not support")):
+        return failure("CPU", "Библиотека не поддерживает инструкции этого процессора. Нужна совместимая сборка CTranslate2 или другой компьютер; смена размера модели не исправит несовместимость CPU.")
+    if any(isinstance(error, ImportError) for error in chain):
+        return failure("DEPENDENCY_IMPORT", "Не удалось загрузить зависимости Whisper/VAD. Проверьте установку backend/requirements.txt; при ошибке DLL на Windows также требуется Microsoft Visual C++ Redistributable x64.")
+    network_names = {"ConnectError", "ProxyError", "ReadError", "WriteError", "RemoteProtocolError", "ConnectionError", "ConnectionResetError", "ConnectionRefusedError", "NetworkError", "XetDownloadError", "OfflineModeIsEnabled", "FileMetadataError"}
+    timeout_names = {"TimeoutError", "TimeoutException", "ConnectTimeout", "ReadTimeout", "WriteTimeout", "PoolTimeout", "InferenceTimeoutError"}
+    if names & timeout_names or any(isinstance(error, TimeoutError) for error in chain):
+        return failure("TIMEOUT", "Истекло время ожидания загрузки модели. Проверьте интернет и доступ к Hugging Face/хранилищу моделей, затем повторите.")
+    if names & network_names or errno_values & {101, 110, 111, 113} or any(marker in text for marker in ("connection reset", "connection refused", "failed to resolve", "name resolution", "network is unreachable", "cas service", "xet", "reqwest", "error sending request", "failed to connect")):
+        return failure("NETWORK", "Не удалось получить модель из сети. Проверьте доступ к Hugging Face и его хранилищу, интернет и настройки прокси; скачанная модель не требует OpenAI-ключа.")
+    if names & {"CorruptedCacheException", "IncompleteSnapshotError", "LocalEntryNotFoundError"} or any(marker in text for marker in ("checksum mismatch", "hash mismatch", "invalid model file", "unable to open file 'model.bin'", "incomplete snapshot")):
+        return failure("MODEL_FILES", "Модель не загружена полностью либо её файлы не прошли проверку. Повторите загрузку модели; не меняйте контрольные суммы и не отключайте проверку файлов.")
+    if phase == "inference" and any(module.startswith("onnxruntime") for module in modules):
+        return failure("VAD", "Не удалось выполнить локальный детектор речи (ONNX Runtime). Проверьте установку onnxruntime и нативных библиотек Windows. Ошибка не означает, что в записи нет речи.")
+    if phase == "inference" and any(module == "av" or module.startswith("av.") for module in modules):
+        return failure("AUDIO", "Не удалось прочитать подготовленное аудио. Проверьте FFmpeg, свободное место и целостность исходного файла, затем повторите обработку.")
+    name = type(exc).__name__
+    safe_name = name if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", name) else "Exception"
+    return failure("UNKNOWN", f"Причина не распознана (тип {safe_name}). Запустите диагностику приложения и передайте её код ошибки; содержимое .env и API-ключи не отправляйте.")
+
+
 def _transcribe_local(path: Path, config: dict, duration: float, progress) -> list[dict]:
+    model_name = str(config.get("whisper_model", "small"))
     try:
         from faster_whisper import WhisperModel
-    except ImportError as exc:
-        raise AIError("Установите зависимости backend: faster-whisper отсутствует.") from exc
+    except Exception as exc:
+        raise local_transcription_error(exc, "import", model_name) from None
     language = config.get("language") or None
     if language == "auto":
         language = None
-    model_name = str(config.get("whisper_model", "small"))
     # CPU int8 works on an ordinary development machine; GPU is opt-in through env.
     device = os.getenv("WHISPER_DEVICE", "cpu")
     compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "int8" if device == "cpu" else "float16")
@@ -94,6 +204,9 @@ def _transcribe_local(path: Path, config: dict, duration: float, progress) -> li
             cpu_threads=max(1, min(4, os.cpu_count() or 1)),
             download_root=os.getenv("WHISPER_CACHE_DIR") or None,
         )
+    except Exception as exc:
+        raise local_transcription_error(exc, "load", model_name) from None
+    try:
         segments, _ = model.transcribe(
             str(path), language=language, word_timestamps=True,
             vad_filter=True, beam_size=5,
@@ -107,12 +220,7 @@ def _transcribe_local(path: Path, config: dict, duration: float, progress) -> li
                 progress(min(0.99, segment.end / max(duration, 1)))
         return words
     except Exception as exc:
-        # Model download exceptions can contain signed URLs. Keep the user error safe.
-        raise AIError(
-            "Локальный Whisper не смог распознать аудио. Проверьте доступность модели "
-            f"{model_name!r}, свободную память, WHISPER_DEVICE и сеть для загрузки весов. "
-            "Можно заранее скачать модель или выбрать OpenAI в настройках."
-        ) from exc
+        raise local_transcription_error(exc, "inference", model_name) from None
 
 
 def _openai_key() -> str:

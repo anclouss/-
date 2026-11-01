@@ -133,6 +133,15 @@ try {
             Invoke-Checked $python @('-m','pip','install','--disable-pip-version-check','-r','backend\requirements.txt')
             Set-Content -LiteralPath $backendMarker -Value $backendHash -Encoding ASCII
         }
+        Write-Host 'Проверяем нативные библиотеки распознавания...' -ForegroundColor Cyan
+        & $python (Join-Path $PSScriptRoot 'check-whisper.py') --native-only
+        $nativeCode = $LASTEXITCODE
+        if ($nativeCode -eq 3) {
+            Install-Tool 'Microsoft.VCRedist.2015+.x64'
+            Invoke-Checked $python @((Join-Path $PSScriptRoot 'check-whisper.py'),'--native-only')
+        } elseif ($nativeCode -ne 0) {
+            throw 'Не загружаются библиотеки Whisper. Запустите Проверить распознавание.cmd и скопируйте сообщение ошибки.'
+        }
         $nodeMarker = Join-Path $root 'frontend\node_modules\.clipforge-lock.sha256'
         $nodeHash = Get-Fingerprint @('frontend\package-lock.json','frontend\package.json')
         if (-not (Marker-Matches $nodeMarker $nodeHash)) {
