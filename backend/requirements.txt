@@ -9,8 +9,10 @@ anyio==4.16.0
     #   httpx
     #   httpx2
     #   starlette
-av==19.0.2
-    # via faster-whisper
+av==18.0.0
+    # via
+    #   -r backend/requirements.in
+    #   faster-whisper
 brotli==1.2.1
     # via yt-dlp
 certifi==2026.10.23

@@ -79,6 +79,14 @@ def test_httpx2_error_type_is_classified_through_wrapped_context():
     assert SECRET not in result
 
 
+def test_pyav19_breaking_change_names_the_actual_fix_without_leaking_input():
+    error = TypeError(f"open() got an unexpected keyword argument 'metadata_errors' {SIGNED}")
+    result = str(local_transcription_error(error, 'inference', 'small'))
+    assert '[STT_INFERENCE_AUDIO_VERSION]' in result
+    assert 'av==18.0.0' in result
+    assert SECRET not in result
+
+
 def test_cycle_in_exception_chain_and_untrusted_model_name_are_safe():
     error = RuntimeError(SIGNED)
     error.__cause__ = error

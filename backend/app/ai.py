@@ -139,6 +139,8 @@ def local_transcription_error(exc: BaseException, phase: str, model_name: str = 
     packages = sorted(missing & {"ctranslate2", "onnxruntime", "numpy", "av", "tokenizers"})
     if packages:
         return failure("DEPENDENCY", f"Не установлена зависимость {packages[0]}. Повторите установку backend/requirements.txt в окружении приложения.")
+    if any(isinstance(error, TypeError) for error in chain) and "metadata_errors" in text and "unexpected keyword" in text:
+        return failure("AUDIO_VERSION", "Несовместимая версия PyAV: faster-whisper требует av==18.0.0. Запустите Исправить распознавание.cmd в папке приложения, затем перезапустите ClipForge. Модели и видео сохранятся.")
     if 28 in errno_values or 112 in winerrors:
         return failure("DISK", "Недостаточно свободного места для модели или временных файлов. Освободите место на диске с каталогом data и повторите.")
     if errno_values & {1, 13} or 5 in winerrors:

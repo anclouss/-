@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import io
 import os
 from pathlib import Path
 import platform
@@ -33,6 +34,27 @@ def native_check():
     return 0
 
 
+def audio_decode_check():
+    """Exercise the real PyAV call; imports alone miss incompatible API changes."""
+    try:
+        from faster_whisper.audio import decode_audio
+        buffer = io.BytesIO()
+        with wave.open(buffer, 'wb') as output:
+            output.setnchannels(1); output.setsampwidth(2); output.setframerate(16000)
+            output.writeframes(b'\0\0' * 1600)
+        buffer.seek(0)
+        audio = decode_audio(buffer, sampling_rate=16000)
+        if len(audio) != 1600:
+            print('FAIL: audio decoder returned an unexpected sample count.', flush=True)
+            return 2
+        print('OK: actual WAV decoding (PyAV compatibility)', flush=True)
+        return 0
+    except Exception as exc:
+        from backend.app.ai import local_transcription_error
+        print(str(local_transcription_error(exc, 'inference')), flush=True)
+        return 2
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--native-only', action='store_true')
@@ -46,6 +68,8 @@ def main():
         print(f'FAIL: configuration dependencies ({type(exc).__name__}). Run the launcher first.', flush=True)
         return 1
     code = native_check()
+    if not code:
+        code = audio_decode_check()
     if code or args.native_only:
         return code
     from backend.app import db
