@@ -80,7 +80,7 @@ def test_upload_recovered_queue_analyze_export_edit_and_zip(pipeline, real_video
 
     with TestClient(main.app) as client:
         with real_video.open('rb') as source:
-            result = client.post('/api/projects/upload', data={'title': 'Pipeline fixture'},
+            result = client.post('/api/projects/upload', data={'title': 'Pipeline fixture', 'defer_render': 'false'},
                                  files={'file': ('recording.mp4', source, 'video/mp4')})
         assert result.status_code == 201, result.text
         project_id = result.json()['id']

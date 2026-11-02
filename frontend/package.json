@@ -1,12 +1,17 @@
 {
   "name": "clipforge-web",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview --host 127.0.0.1"
+    "preview": "vite preview --host 127.0.0.1",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src --max-warnings 0",
+    "test": "vitest run --maxWorkers=2",
+    "format": "prettier --write \"src/**/*.{ts,tsx}\" eslint.config.js",
+    "format:check": "prettier --check \"src/**/*.{ts,tsx}\" eslint.config.js"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",
@@ -15,10 +20,17 @@
     "react-router-dom": "^7.1.0"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.4",
+    "eslint": "^10.14.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "globals": "^15.15.0",
+    "prettier": "^3.9.10",
     "typescript": "~5.7.2",
-    "vite": "^6.0.5"
+    "typescript-eslint": "^8.72.1",
+    "vite": "^6.0.5",
+    "vitest": "^3.2.7"
   }
 }

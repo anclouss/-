@@ -3,6 +3,7 @@
 Input is the worker's PCM16 WAV. Memory is proportional to the compact output,
 not the size of a many-hour recording. No model or network is used here.
 """
+
 from __future__ import annotations
 
 import math
@@ -67,14 +68,18 @@ def extract_signals(audio_path: Path) -> dict:
             position += frames
             if window_frames >= rate * 2:
                 rms_db = max(-96.0, 10.0 * math.log10(max(window_sum / window_samples, 1e-12)))
-                envelope.append({"time": round((window_start + block_end) / 2, 3), "db": round(rms_db, 2)})
+                envelope.append(
+                    {"time": round((window_start + block_end) / 2, 3), "db": round(rms_db, 2)}
+                )
                 window_start = block_end
                 window_sum = 0.0
                 window_samples = 0
                 window_frames = 0
         if window_samples:
             rms_db = max(-96.0, 10.0 * math.log10(max(window_sum / window_samples, 1e-12)))
-            envelope.append({"time": round((window_start + duration) / 2, 3), "db": round(rms_db, 2)})
+            envelope.append(
+                {"time": round((window_start + duration) / 2, 3), "db": round(rms_db, 2)}
+            )
         if silence_start is not None and duration - silence_start >= 0.75:
             pauses.append({"start": round(silence_start, 3), "end": round(duration, 3)})
 
@@ -90,11 +95,13 @@ def extract_signals(audio_path: Path) -> dict:
             previous = levels[index - 1] if index else -96.0
             following = levels[index + 1] if index + 1 < len(levels) else -96.0
             if level >= threshold and level >= previous and level > following:
-                bursts.append({
-                    "time": point["time"],
-                    "strength": round(min(1.0, max(0.0, (level - median) / 24.0)), 3),
-                    "db": level,
-                })
+                bursts.append(
+                    {
+                        "time": point["time"],
+                        "strength": round(min(1.0, max(0.0, (level - median) / 24.0)), 3),
+                        "db": level,
+                    }
+                )
     return {
         "duration": round(duration, 3),
         "rms": envelope,

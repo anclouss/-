@@ -1,0 +1,7 @@
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+exclude = [".venv", "data", "frontend/node_modules", "frontend/dist"]
+
+[tool.ruff.lint]
+select = ["F"]

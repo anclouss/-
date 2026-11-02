@@ -1,6 +1,6 @@
 export type Word = { start: number; end: number; text: string };
 export type ClipSettings = {
-  layout: 'crop' | 'fit' | 'split';
+  layout: "crop" | "fit" | "split";
   crop_x: number;
   crop_y: number;
   face_box: number[];
@@ -22,7 +22,7 @@ export type Clip = {
   start: number;
   end: number;
   duration: number;
-  status: 'queued' | 'rendering' | 'ready' | 'failed';
+  status: "draft" | "queued" | "rendering" | "ready" | "failed";
   error?: string | null;
   revision: number;
   settings: Partial<ClipSettings>;
@@ -33,7 +33,7 @@ export type Clip = {
 export type Project = {
   id: string;
   title: string;
-  status: 'queued' | 'processing' | 'completed' | 'failed';
+  status: "queued" | "processing" | "completed" | "failed" | "cancelled";
   stage: string;
   progress: number;
   error?: string | null;
@@ -44,11 +44,12 @@ export type Project = {
   analysis_provider?: string;
   source_available?: boolean;
   clips?: Clip[];
+  mode?: "auto" | "editor";
 };
 export type Settings = {
-  transcription_provider: 'local' | 'openai';
+  transcription_provider: "local" | "openai";
   whisper_model: string;
-  analysis_provider: 'ollama' | 'openai' | 'heuristic';
+  analysis_provider: "ollama" | "openai" | "heuristic";
   openai_model: string;
   ollama_model: string;
   max_clips: number;
@@ -57,81 +58,152 @@ export type Settings = {
   language: string;
   providers: { openai: boolean; ollama: boolean; ffmpeg: boolean };
 };
-
-export const defaultClipSettings: ClipSettings = {
-  layout: 'crop', crop_x: 0.5, crop_y: 0.5, face_box: [0, 0, 0.3, 0.4],
-  subtitle_font: 'Arial', subtitle_size: 58, subtitle_position: 0.76,
-  subtitle_color: '#B8FF60', subtitles: true, auto_zoom: false,
-  remove_silence: false, face_tracking: false,
-};
-
-function errorMessage(data: unknown, fallback: string): string {
-  if (typeof data === 'object' && data !== null && 'detail' in data) {
-    const detail = (data as { detail: unknown }).detail;
-    if (typeof detail === 'string') return detail;
-    if (Array.isArray(detail)) return detail.map(d => d.msg || JSON.stringify(d)).join('; ');
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number,
+  ) {
+    super(message);
+    this.name = "ApiError";
   }
+}
+export const message = (error: unknown): string =>
+  error instanceof Error ? error.message : "Не удалось выполнить действие.";
+export const aborted = (error: unknown): boolean =>
+  error instanceof DOMException && error.name === "AbortError";
+function errorMessage(data: unknown, fallback: string): string {
+  if (typeof data !== "object" || data === null || !("detail" in data))
+    return fallback;
+  const detail: unknown = data.detail;
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail))
+    return detail
+      .map((entry: unknown) =>
+        typeof entry === "object" &&
+        entry !== null &&
+        "msg" in entry &&
+        typeof entry.msg === "string"
+          ? entry.msg
+          : "Проверьте параметры запроса.",
+      )
+      .join("; ");
   return fallback;
 }
-
-export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
-  let res: Response;
+export async function api<T>(
+  path: string,
+  options: RequestInit = {},
+): Promise<T> {
+  const headers = new Headers(options.headers);
+  if (options.body) headers.set("Content-Type", "application/json");
+  let response: Response;
   try {
-    res = await fetch(`/api${path}`, {
-      ...options,
-      headers: { ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...options.headers },
-    });
-  } catch {
-    throw new Error('Нет связи с сервером. Проверьте, что backend запущен на порту 8000.');
+    response = await fetch(`/api${path}`, { ...options, headers });
+  } catch (error) {
+    if (aborted(error)) throw error;
+    throw new ApiError(
+      "Сервер недоступен. Проверьте окно запуска ClipForge.",
+      0,
+    );
   }
-  if (!res.ok) {
-    const data: unknown = await res.json().catch(() => null);
-    throw new Error(errorMessage(data, `Ошибка сервера (${res.status})`));
-  }
-  if (res.status === 204) return undefined as T;
-  return res.json() as Promise<T>;
+  if (!response.ok)
+    throw new ApiError(
+      errorMessage(
+        await response.json().catch(() => null),
+        `Сервер вернул ошибку ${response.status}.`,
+      ),
+      response.status,
+    );
+  return response.status === 204
+    ? (undefined as T)
+    : (response.json() as Promise<T>);
 }
-
-export function uploadFile(file: File, title: string, onProgress: (value: number) => void, signal?: AbortSignal): Promise<Project> {
+export function uploadFile(
+  file: File,
+  title: string,
+  mode: "editor" | "auto",
+  onProgress: (value: number) => void,
+  signal: AbortSignal,
+): Promise<Project> {
   return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new DOMException("Загрузка отменена.", "AbortError"));
+      return;
+    }
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', '/api/projects/upload');
-    xhr.upload.onprogress = event => {
-      if (event.lengthComputable) onProgress(Math.round(event.loaded / event.total * 100));
+    const cancel = () => xhr.abort();
+    const cleanup = () => {
+      signal.removeEventListener("abort", cancel);
+      xhr.onload = null;
+      xhr.onerror = null;
+      xhr.onabort = null;
+      xhr.upload.onprogress = null;
     };
-    xhr.onerror = () => reject(new Error('Не удалось загрузить файл. Проверьте соединение с backend.'));
-    xhr.onabort = () => reject(new Error('Загрузка отменена.'));
+    xhr.open("POST", "/api/projects/upload");
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable)
+        onProgress(Math.round((event.loaded / event.total) * 100));
+    };
+    xhr.onerror = () => {
+      cleanup();
+      reject(
+        new ApiError(
+          "Загрузка прервана соединением. Проверьте сервер и повторите.",
+          0,
+        ),
+      );
+    };
+    xhr.onabort = () => {
+      cleanup();
+      reject(new DOMException("Загрузка отменена.", "AbortError"));
+    };
     xhr.onload = () => {
+      const status = xhr.status;
       let body: unknown;
-      try { body = JSON.parse(xhr.responseText); } catch { reject(new Error('Некорректный ответ сервера.')); return; }
-      if (xhr.status >= 200 && xhr.status < 300) resolve(body as Project);
-      else reject(new Error(errorMessage(body, `Ошибка загрузки (${xhr.status})`)));
+      try {
+        body = JSON.parse(xhr.responseText);
+      } catch {
+        cleanup();
+        reject(new ApiError("Сервер вернул некорректный ответ.", status));
+        return;
+      }
+      cleanup();
+      if (status >= 200 && status < 300) resolve(body as Project);
+      else
+        reject(
+          new ApiError(
+            errorMessage(body, `Не удалось загрузить файл (${status}).`),
+            status,
+          ),
+        );
     };
-    if (signal) signal.addEventListener('abort', () => xhr.abort(), { once: true });
+    signal.addEventListener("abort", cancel, { once: true });
     const data = new FormData();
-    data.append('file', file);
-    if (title.trim()) data.append('title', title.trim());
+    data.append("file", file);
+    data.append("mode", mode);
+    data.append("defer_render", "true");
+    if (title.trim()) data.append("title", title.trim());
     xhr.send(data);
   });
 }
-
-export function time(value: number): string {
-  if (!Number.isFinite(value)) return '00:00';
-  const seconds = Math.max(0, Math.floor(value));
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.floor(seconds % 3600 / 60);
-  const rest = seconds % 60;
-  return `${hours ? `${String(hours).padStart(2, '0')}:` : ''}${String(minutes).padStart(2, '0')}:${String(rest).padStart(2, '0')}`;
+export function time(value: number, decimals = false): string {
+  if (!Number.isFinite(value)) return "00:00";
+  const seconds = Math.max(0, value),
+    whole = Math.floor(seconds),
+    hours = Math.floor(whole / 3600);
+  return `${hours ? `${String(hours).padStart(2, "0")}:` : ""}${String(Math.floor((whole % 3600) / 60)).padStart(2, "0")}:${String(whole % 60).padStart(2, "0")}${decimals ? `.${Math.floor((seconds % 1) * 10)}` : ""}`;
 }
-
-export function previewUrl(clip: Clip): string {
-  const url = clip.preview_url || `/media/clips/${clip.id}`;
-  return `${url}${url.includes('?') ? '&' : '?'}revision=${clip.revision || 0}`;
-}
-
 export const stageLabels: Record<string, string> = {
-  uploading: 'Загрузка видео', queued: 'В очереди', downloading: 'Загрузка по ссылке',
-  extracting_audio: 'Извлечение аудио', transcribing: 'Распознавание речи',
-  analyzing: 'Анализ контекста', finding_clips: 'Поиск лучших моментов',
-  rendering: 'Экспорт клипов', done: 'Готово', failed: 'Ошибка обработки',
+  queued: "В очереди",
+  uploading: "Загрузка",
+  downloading: "Загрузка записи",
+  extracting_audio: "Подготовка аудио",
+  transcribing: "Распознавание речи",
+  analyzing: "Анализ контекста",
+  finding_clips: "Выбор моментов",
+  rendering: "Рендеринг",
+  done: "Готово",
+  preparing: "Подготовка",
+  adding_subtitles: "Субтитры",
+  encoding: "Кодирование",
+  finalizing: "Завершение",
 };
